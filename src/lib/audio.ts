@@ -5,13 +5,20 @@ const SPEECH_CONTINUE_RMS = 0.006;
 const SILENCE_MS = 800;
 const MIN_SPEECH_MS = 280;
 const MIN_VOICED_MS = 100;
-const MAX_UTTERANCE_MS = 15_000;
-const PREROLL_MS = 320;
+const MAX_UTTERANCE_MS = 40_000;
+const PREROLL_MS = 480;
 const CHECK_MS = 24;
 const WINDOW_MS = 32;
 const FLOOR_MIN = 0.0015;
-const FLOOR_MAX = 0.02;
+const FLOOR_MAX = 0.08;
 const LEVEL_EVERY_MS = 50;
+const FFT_SIZE = 512;
+const ANALYSIS_RATE = 16_000;
+const HARM_MIN = 4;
+const CV_MOVING = 0.2;
+const CV_STEADY = 0.17;
+const DIST_SPEECH = 0.08;
+const VOICE_HANG_MS = 420;
 
 type SpeechHandler = (wav: Uint8Array) => void;
 
@@ -67,60 +74,104 @@ export function normalizeSensitivity(value: string | undefined): MicSensitivity 
 }
 
 /**
- * Tracks the quiet level of the room so a fan or a hum does not count as a voice.
- * It is updated once per check, drops quickly, rises slowly, and never follows a voice.
+ * The room behind the speaker: a level, and the spectrum of whatever has been droning.
+ * A fan is loud and may even have a pitch, but it does not change. Speech does.
+ * The level only rises toward a steady drone, never toward a voice, so a long turn
+ * cannot push the gate up until the next sentence is missed.
  */
-class NoiseFloor {
+class RoomSound {
   private value = 0.006;
-  private warm = 0;
+  private levels: number[] = [];
+  private stationaryMs = 0;
+  private noise = new Float64Array(FFT_SIZE / 2);
+  private smooth = new Float64Array(FFT_SIZE / 2);
+  private noiseN = 0;
+  private smoothN = 0;
+  moving = false;
+  distance = 0;
 
   get floor(): number {
     return this.value;
   }
 
-  observe(rms: number, speaking: boolean, voiced: boolean): void {
+  /** Call once per check, before deciding whether this window is speech. */
+  prepare(rms: number, mag: Float64Array | null, frameMs: number): void {
     if (!Number.isFinite(rms)) {
       return;
     }
-    if (this.warm < 8) {
-      // The first few checks seed the floor from whatever the room sounds like.
-      this.warm += 1;
-      this.value = this.warm === 1 ? rms : this.value * 0.7 + rms * 0.3;
+    this.levels.push(rms);
+    if (this.levels.length > 16) {
+      this.levels.shift();
+    }
+    const mean = this.levels.reduce((sum, level) => sum + level, 0) / this.levels.length;
+    const variance = this.levels.reduce((sum, level) => sum + (level - mean) ** 2, 0) / this.levels.length;
+    const cv = Math.sqrt(variance) / Math.max(1e-9, mean);
+    const ready = this.levels.length >= 12;
+    this.moving = ready && cv >= CV_MOVING;
+    this.stationaryMs = ready && cv < CV_STEADY ? this.stationaryMs + frameMs : 0;
+    if (mag) {
+      const rate = this.smoothN === 0 ? 1 : 0.35;
+      for (let index = 0; index < mag.length; index += 1) {
+        this.smooth[index] = (this.smooth[index] ?? 0) * (1 - rate) + (mag[index] ?? 0) * rate;
+      }
+      this.smoothN += 1;
+    }
+    this.distance = 0;
+    if (mag && this.noiseN >= 8) {
+      let dot = 0;
+      let left = 0;
+      let right = 0;
+      for (let index = 4; index < 200; index += 1) {
+        const current = Math.log((this.smooth[index] ?? 0) + 1e-6);
+        const room = Math.log((this.noise[index] ?? 0) + 1e-6);
+        dot += current * room;
+        left += current * current;
+        right += room * room;
+      }
+      this.distance = 1 - dot / Math.max(1e-9, Math.sqrt(left * right));
+    }
+  }
+
+  /** Call after the voice decision. A steady fan becomes the room. Speech does not. */
+  commit(rms: number, mag: Float64Array | null, speaking: boolean, voiced: boolean): void {
+    if (!Number.isFinite(rms)) {
+      return;
+    }
+    const steady = this.stationaryMs > 400;
+    if (!speaking && mag && steady && !voiced) {
+      const rate = 0.15;
+      for (let index = 0; index < mag.length; index += 1) {
+        this.noise[index] = (this.noise[index] ?? 0) * (1 - rate) + (mag[index] ?? 0) * rate;
+      }
+      this.noiseN += 1;
+      this.value = this.value * 0.75 + rms * 0.25;
     } else if (rms < this.value) {
-      this.value = this.value * 0.85 + rms * 0.15;
-    } else if (speaking || voiced) {
-      // A voice is not room noise. Leave the floor alone.
-    } else if (rms < this.value * 2.5) {
-      this.value = this.value * 0.97 + rms * 0.03;
-    } else {
-      // Loud but not a voice: a door, typing, a fan speeding up. Creep up slowly.
-      this.value *= 1.004;
+      this.value = this.value * 0.8 + rms * 0.2;
     }
     this.value = Math.min(FLOOR_MAX, Math.max(FLOOR_MIN, this.value));
   }
 
-  // The pitch test does most of the filtering, so these energy gates only need to sit above the room.
   startThreshold(loudness: number): number {
-    return Math.max(SPEECH_START_RMS, this.value * 2.2) * loudness;
+    return Math.max(SPEECH_START_RMS, this.value * 1.22) * loudness;
   }
 
   bargeThreshold(loudness: number): number {
-    return Math.max(BARGE_START_RMS, this.value * 4) * loudness;
+    return Math.max(BARGE_START_RMS, this.value * 2.2) * loudness;
   }
 
-  // Sensitivity may lower the fixed part, but never the part that sits above the room,
-  // or a fan would keep a sentence "going" forever.
   continueThreshold(loudness: number): number {
-    return Math.max(SPEECH_CONTINUE_RMS * Math.min(1, loudness), this.value * 1.4);
+    return Math.max(SPEECH_CONTINUE_RMS * Math.min(1, loudness), this.value * 1.12);
   }
 }
 
 function baseConstraints(deviceId: string | undefined): MediaTrackConstraints {
+  // The browser's own noise suppressor and gain control learn the user's voice and,
+  // after a long turn, turn that voice down. Tolly judges the room itself instead.
   const audio: MediaTrackConstraints = {
     channelCount: 1,
     echoCancellation: true,
-    noiseSuppression: true,
-    autoGainControl: true,
+    noiseSuppression: false,
+    autoGainControl: false,
   };
   if (deviceId) {
     audio.deviceId = { exact: deviceId };
@@ -129,10 +180,7 @@ function baseConstraints(deviceId: string | undefined): MediaTrackConstraints {
 }
 
 async function openMicrophone(deviceId: string | undefined): Promise<MediaStream> {
-  const attempts: MediaTrackConstraints[] = [
-    { ...baseConstraints(deviceId), voiceIsolation: true } as MediaTrackConstraints,
-    baseConstraints(deviceId),
-  ];
+  const attempts: MediaTrackConstraints[] = [baseConstraints(deviceId)];
   if (deviceId) {
     // The chosen microphone may be unplugged. Fall back to the system default.
     attempts.push(baseConstraints(undefined));
@@ -194,12 +242,15 @@ type Shape = {
   rms: number;
   /** 0 to 1, how strongly the window repeats at a speaking pitch. */
   voice: number;
+  /** How many harmonics of that pitch stand above their neighbors. */
+  harmonics: number;
+  mag: Float64Array | null;
 };
 
 function describeWindow(samples: Float32Array, sampleRate: number): Shape {
   const length = samples.length;
   if (length < sampleRate * 0.02) {
-    return { rms: 0, voice: 0 };
+    return { rms: 0, voice: 0, harmonics: 0, mag: null };
   }
   let sum = 0;
   let energy = 0;
@@ -220,22 +271,25 @@ function describeWindow(samples: Float32Array, sampleRate: number): Shape {
     previous = sample;
   }
   const rms = Math.sqrt(energy / length);
+  const mag = energy >= 1e-9 ? analysisMagnitudes(samples, sampleRate) : null;
   if (energy < 1e-9) {
-    return { rms, voice: 0 };
+    return { rms, voice: 0, harmonics: 0, mag };
   }
   const zeroCrossingRate = crossings / Math.max(1, length - 1);
   // Hiss and clicks cross zero very often. A hum barely crosses at all.
   if (zeroCrossingRate > 0.22 || zeroCrossingRate < 0.004) {
-    return { rms, voice: 0 };
+    return { rms, voice: 0, harmonics: 0, mag };
   }
   // Speech carries most of its energy in the harmonics above 300 Hz. Mains hum, a fridge, and
   // traffic rumble sit below that, so the signal barely moves from one sample to the next.
   const tilt = motion / energy;
   const lowest = Math.pow((2 * Math.PI * 300) / sampleRate, 2);
   if (tilt < lowest) {
-    return { rms, voice: 0 };
+    return { rms, voice: 0, harmonics: 0, mag };
   }
-  return { rms, voice: pitchScore(samples, length, sampleRate, sum / length) };
+  const pitched = pitchScore(samples, length, sampleRate, sum / length);
+  const harmonics = mag && pitched.lag > 0 ? countHarmonics(mag, sampleRate / pitched.lag) : 0;
+  return { rms, voice: pitched.score, harmonics, mag };
 }
 
 /**
@@ -243,11 +297,11 @@ function describeWindow(samples: Float32Array, sampleRate: number): Shape {
  * Voiced speech repeats strongly at its pitch period and scores well above 0.5.
  * Breath, hiss, and keyboard clicks score near zero.
  */
-function pitchScore(samples: Float32Array, length: number, sampleRate: number, mean: number): number {
+function pitchScore(samples: Float32Array, length: number, sampleRate: number, mean: number): { score: number; lag: number } {
   const minLag = Math.max(2, Math.floor(sampleRate / 400));
   const maxLag = Math.min(length - 2, Math.floor(sampleRate / 80));
   if (maxLag <= minLag) {
-    return 0;
+    return { score: 0, lag: 0 };
   }
   const centered = new Float32Array(length);
   const prefix = new Float64Array(length + 1);
@@ -258,9 +312,10 @@ function pitchScore(samples: Float32Array, length: number, sampleRate: number, m
   }
   const total = prefix[length] ?? 0;
   if (total < 1e-8) {
-    return 0;
+    return { score: 0, lag: 0 };
   }
   let best = 0;
+  let bestLag = 0;
   for (let lag = minLag; lag <= maxLag; lag += 2) {
     const limit = length - lag;
     let correlation = 0;
@@ -276,9 +331,103 @@ function pitchScore(samples: Float32Array, length: number, sampleRate: number, m
     const normalized = correlation / Math.max(1e-9, Math.sqrt(head * tail));
     if (normalized > best) {
       best = normalized;
+      bestLag = lag;
     }
   }
-  return Math.min(1, best);
+  return { score: Math.min(1, best), lag: bestLag };
+}
+
+function transform(real: Float64Array, imag: Float64Array): void {
+  const size = real.length;
+  for (let index = 1, swap = 0; index < size; index += 1) {
+    let bit = size >> 1;
+    for (; swap & bit; bit >>= 1) {
+      swap ^= bit;
+    }
+    swap ^= bit;
+    if (index < swap) {
+      const realSwap = real[index] ?? 0;
+      const imagSwap = imag[index] ?? 0;
+      real[index] = real[swap] ?? 0;
+      imag[index] = imag[swap] ?? 0;
+      real[swap] = realSwap;
+      imag[swap] = imagSwap;
+    }
+  }
+  for (let length = 2; length <= size; length <<= 1) {
+    const angle = (-2 * Math.PI) / length;
+    const stepReal = Math.cos(angle);
+    const stepImag = Math.sin(angle);
+    for (let start = 0; start < size; start += length) {
+      let twiddleReal = 1;
+      let twiddleImag = 0;
+      for (let offset = 0; offset < length / 2; offset += 1) {
+        const evenReal = real[start + offset] ?? 0;
+        const evenImag = imag[start + offset] ?? 0;
+        const oddIndex = start + offset + length / 2;
+        const oddReal = (real[oddIndex] ?? 0) * twiddleReal - (imag[oddIndex] ?? 0) * twiddleImag;
+        const oddImag = (real[oddIndex] ?? 0) * twiddleImag + (imag[oddIndex] ?? 0) * twiddleReal;
+        real[start + offset] = evenReal + oddReal;
+        imag[start + offset] = evenImag + oddImag;
+        real[oddIndex] = evenReal - oddReal;
+        imag[oddIndex] = evenImag - oddImag;
+        const nextReal = twiddleReal * stepReal - twiddleImag * stepImag;
+        twiddleImag = twiddleReal * stepImag + twiddleImag * stepReal;
+        twiddleReal = nextReal;
+      }
+    }
+  }
+}
+
+/** 512 magnitudes from 0 to 8 kHz, so a fan tone and a vowel can be compared. */
+function analysisMagnitudes(samples: Float32Array, sampleRate: number): Float64Array | null {
+  const step = sampleRate / ANALYSIS_RATE;
+  const needed = Math.floor(step * FFT_SIZE);
+  if (samples.length < needed || needed < 64) {
+    return null;
+  }
+  const real = new Float64Array(FFT_SIZE);
+  const imag = new Float64Array(FFT_SIZE);
+  const offset = samples.length - needed;
+  for (let index = 0; index < FFT_SIZE; index += 1) {
+    const position = offset + index * step;
+    const at = Math.floor(position);
+    const fraction = position - at;
+    const left = samples[at] ?? 0;
+    const right = samples[Math.min(samples.length - 1, at + 1)] ?? left;
+    const window = 0.5 - 0.5 * Math.cos((2 * Math.PI * index) / (FFT_SIZE - 1));
+    real[index] = (left + (right - left) * fraction) * window;
+  }
+  transform(real, imag);
+  const mag = new Float64Array(FFT_SIZE / 2);
+  for (let index = 0; index < mag.length; index += 1) {
+    mag[index] = Math.hypot(real[index] ?? 0, imag[index] ?? 0);
+  }
+  return mag;
+}
+
+function countHarmonics(mag: Float64Array, fundamental: number): number {
+  if (fundamental < 70 || fundamental > 500) {
+    return 0;
+  }
+  const binHz = ANALYSIS_RATE / FFT_SIZE;
+  let count = 0;
+  for (let harmonic = 1; harmonic <= 8; harmonic += 1) {
+    const frequency = fundamental * harmonic;
+    if (frequency > 4500) {
+      break;
+    }
+    const bin = Math.round(frequency / binHz);
+    if (bin < 2 || bin >= mag.length - 2) {
+      break;
+    }
+    const peak = mag[bin] ?? 0;
+    const neighbors = ((mag[bin - 2] ?? 0) + (mag[bin + 2] ?? 0)) / 2;
+    if (peak > neighbors * 1.7) {
+      count += 1;
+    }
+  }
+  return count;
 }
 
 export class SpeechCapture {
@@ -304,7 +453,8 @@ export class SpeechCapture {
   private voicedMs = 0;
   private sinceLevelMs = 0;
   private lastVoiced = false;
-  private noise = new NoiseFloor();
+  private sinceVoiceMs = 1_000;
+  private room = new RoomSound();
   private onUtterance: SpeechHandler;
   private onSpeechStart: () => void;
   private onLevel: LevelHandler;
@@ -399,8 +549,8 @@ export class SpeechCapture {
       return;
     }
     this.sinceLevelMs = 0;
-    const floor = this.noise.floor;
-    const span = Math.max(0.03, this.noise.startThreshold(this.tuning.loudness) * 3);
+    const floor = this.room.floor;
+    const span = Math.max(0.03, this.room.startThreshold(this.tuning.loudness) * 3);
     const level = Math.min(1, Math.max(0, (rms - floor) / span));
     this.onLevel({
       level: Math.sqrt(level),
@@ -417,6 +567,7 @@ export class SpeechCapture {
     this.prerollMs = 0;
     this.evidenceMs = 0;
     this.voicedMs = 0;
+    this.sinceVoiceMs = 1_000;
     this.sinceCheckMs = 0;
     this.preroll = [];
     this.utterance = [];
@@ -459,7 +610,7 @@ export class SpeechCapture {
     if (this.holding) {
       this.utterance.push(samples);
       this.speechMs += frameMs;
-      this.report(rms, frameMs, rms >= this.noise.continueThreshold(loudness));
+      this.report(rms, frameMs, rms >= this.room.continueThreshold(loudness));
       if (this.speechMs >= MAX_UTTERANCE_MS) {
         this.endHold();
       }
@@ -475,16 +626,24 @@ export class SpeechCapture {
       checkedMs = this.sinceCheckMs;
       this.sinceCheckMs = 0;
       const shape = describeWindow(this.copyWindow(), sampleRate);
+      this.room.prepare(shape.rms, shape.mag, checkedMs);
       const minRms = this.bargeIn
-        ? this.noise.bargeThreshold(loudness)
+        ? this.room.bargeThreshold(loudness)
         : this.speaking
-          ? this.noise.continueThreshold(loudness)
-          : this.noise.startThreshold(loudness);
+          ? this.room.continueThreshold(loudness)
+          : this.room.startThreshold(loudness);
       const minScore = this.bargeIn ? this.tuning.bargeScore : this.tuning.voiceScore;
-      // A loud sound right at the microphone counts even when its pitch is smeared.
-      const clearlyLoud = !this.bargeIn && shape.rms >= minRms * 2.5 && shape.voice >= minScore * 0.6;
-      heardVoice = shape.rms >= minRms && (shape.voice >= minScore || clearlyLoud);
-      this.noise.observe(shape.rms, this.speaking, heardVoice);
+      // A loud voice at the microphone can smear its pitch. It still needs a stack of
+      // harmonics, and it still has to be moving: a fan tone is steady and does not count.
+      const pitchOk = shape.voice >= minScore || (shape.rms >= minRms * 2.5 && shape.voice >= minScore * 0.6);
+      const tonal = shape.harmonics >= HARM_MIN && pitchOk;
+      heardVoice = shape.rms >= minRms && tonal && (this.speaking ? this.room.moving || this.room.distance >= DIST_SPEECH : this.room.moving);
+      this.room.commit(shape.rms, shape.mag, this.speaking, heardVoice);
+    }
+    if (heardVoice) {
+      this.sinceVoiceMs = 0;
+    } else if (ready) {
+      this.sinceVoiceMs += checkedMs;
     }
     this.report(rms, frameMs, heardVoice);
 
@@ -531,7 +690,10 @@ export class SpeechCapture {
     if (heardVoice) {
       this.voicedMs += checkedMs;
     }
-    if (rms >= this.noise.continueThreshold(loudness)) {
+    // A fan stays loud after the person stops. Energy alone must not keep the turn open.
+    // A consonant still counts, for a short hang after the last real voice.
+    const hanging = this.sinceVoiceMs < VOICE_HANG_MS && rms >= this.room.continueThreshold(loudness);
+    if (heardVoice || hanging) {
       this.silenceMs = 0;
     } else {
       this.silenceMs += frameMs;

@@ -35,7 +35,7 @@ import {
 const QUIET: MicLevel = { level: 0, voiced: false, capturing: false };
 
 const EMPTY_SESSION: Bootstrap = {
-  version: "1.2.0",
+  version: "1.2.1",
   groqConfigured: false,
   cartesiaConfigured: false,
   preferences: DEFAULT_PREFERENCES,

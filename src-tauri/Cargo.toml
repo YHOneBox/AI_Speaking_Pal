@@ -1,6 +1,6 @@
 [package]
 name = "ai-speaking-pal"
-version = "1.2.0"
+version = "1.2.1"
 description = "Portable conversational English practice companion"
 authors = ["Tolly"]
 edition = "2021"
